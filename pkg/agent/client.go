@@ -54,6 +54,7 @@ type endpointConn struct {
 	cleanOnce sync.Once
 	warnChLim bool
 	dialDone  chan struct{}
+	sendDone  chan struct{}
 }
 
 func (e *endpointConn) cleanup() {
@@ -385,10 +386,13 @@ func (a *Client) Serve() {
 			dataCh := make(chan []byte, a.cs.xfrChannelSize)
 			sendCh := make(chan []byte, a.cs.xfrChannelSize)
 			dialDone := make(chan struct{})
+			sendDone := make(chan struct{})
 			eConn := &endpointConn{
+				connID:    connID,
 				dataCh:    dataCh,
 				sendCh:    sendCh,
 				dialDone:  dialDone,
+				sendDone:  sendDone,
 				warnChLim: a.warnOnChannelLimit,
 			}
 			eConn.cleanFunc = func() {
@@ -400,6 +404,8 @@ func (a *Client) Serve() {
 					return
 				}
 				klog.V(4).InfoS("close connection", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
+				close(eConn.sendCh)
+				<-eConn.sendDone
 				var closePkt *client.Packet
 				if connID == 0 {
 					closePkt = &client.Packet{
@@ -423,8 +429,8 @@ func (a *Client) Serve() {
 						klog.ErrorS(err, "close response failure", "connectionID", connID, "dialID", dialReq.Random)
 					}
 				}
-				close(dataCh)
-				a.connManager.Delete(connID)
+				close(eConn.dataCh)
+				a.connManager.Delete(eConn.connID)
 				if err := eConn.conn.Close(); err != nil {
 					klog.ErrorS(err, "failed to close connection to remote", "dialID", dialReq.Random, "connectionID", connID)
 				}
@@ -453,6 +459,7 @@ func (a *Client) Serve() {
 					if err := a.Send(dialResp); err != nil {
 						klog.ErrorS(err, "could not send DIAL_RSP with error", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
 					}
+					close(eConn.sendDone)
 					// Cannot invoke clean up as we have no conn yet.
 					return
 				}
@@ -471,6 +478,7 @@ func (a *Client) Serve() {
 				)
 				if err := a.Send(dialResp); err != nil {
 					klog.ErrorS(err, "could not send DIAL_RSP", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
+					close(eConn.sendDone)
 					// clean-up is normally called from remoteToProxy which we will never invoke.
 					// So we are invoking it here to force the clean-up to occur.
 					// However, cleanup will block until dialDone is closed.
@@ -546,7 +554,6 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 		}
 	}()
 	defer eConn.cleanup()
-	defer close(eConn.sendCh)
 
 	var buf [1 << 12]byte
 
@@ -555,7 +562,6 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 		klog.V(5).InfoS("received data from remote", "bytes", n, "connectionID", connID)
 
 		if err == io.EOF {
-			klog.V(2).InfoS("remote connection EOF", "connectionID", connID)
 			return
 		} else if err != nil {
 			// "use of closed network connection" errors are expected upon receiving CLOSE_REQ
@@ -567,10 +573,12 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 			}
 			return
 		}
-
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
+		if eConn.warnChLim && len(eConn.sendCh) >= cap(eConn.sendCh) {
+			klog.V(2).InfoS("Send channel on agent is full", "connectionID", eConn.connID)
+		}
 		select {
 		case eConn.sendCh <- data:
 		case <-a.stopCh:
@@ -580,6 +588,7 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 }
 
 func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
+	defer close(eConn.sendDone)
 	defer func() {
 		if panicInfo := recover(); panicInfo != nil {
 			klog.V(2).InfoS("Exiting sendChannelToProxy with recovery", "panicInfo", panicInfo, "connectionID", connID)
@@ -587,16 +596,35 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 			klog.V(4).InfoS("Exiting sendChannelToProxy", "connectionID", connID)
 		}
 	}()
-
-	resp := &client.Packet{
-		Type: client.PacketType_DATA,
-	}
+	// Not safe to call cleanup here, as cleanup() closes the sendCh
+	// and we are the receiver for the dataCh. Also we now have a later
+	// defer which will block until sendCh is closed.
+	defer func() {
+		// As the read side of the dataCh channel, we cannot close it.
+		// However serve() may be blocked writing to the channel,
+		// so we need to consume the channel until it is closed.
+		discardedPktCount := 0
+		for range eConn.sendCh {
+			// Ignore values as this indicates there was a problem
+			// with the remote connection.
+			discardedPktCount++
+		}
+		if discardedPktCount > 0 {
+			klog.V(1).InfoS("Discard packets while exiting sendChannelToProxy", "pktCount", discardedPktCount, "connectionID", connID)
+		}
+	}()
 
 	for d := range eConn.sendCh {
-		resp.Payload = &client.Packet_Data{Data: &client.Data{
-			Data:      d,
-			ConnectID: connID,
-		}}
+		resp := &client.Packet{
+			Type: client.PacketType_DATA,
+			Payload: &client.Packet_Data{
+				Data: &client.Data{
+					Data:      d,
+					ConnectID: connID,
+				},
+			},
+		}
+
 		if err := a.Send(resp); err != nil {
 			klog.ErrorS(err, "could not send DATA", "connectionID", connID)
 		}
@@ -625,7 +653,7 @@ func (a *Client) dataChannelToRemote(connID int64, eConn *endpointConn) {
 			discardedPktCount++
 		}
 		if discardedPktCount > 0 {
-			klog.V(2).InfoS("Discard packets while exiting dataChannelToRemote", "pktCount", discardedPktCount, "connectionID", connID)
+			klog.V(1).InfoS("Discard packets while exiting dataChannelToRemote", "pktCount", discardedPktCount, "connectionID", connID)
 		}
 	}()
 
