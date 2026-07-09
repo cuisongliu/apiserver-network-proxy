@@ -49,12 +49,25 @@ type endpointConn struct {
 	conn      net.Conn
 	connID    int64
 	cleanFunc func()
+
+	// dataCh is a queue to decouple reads from the ANP Server
+	// to the corresponding writes to the data plane.
+	// This is for traffic coming from the KAS.
 	dataCh    chan []byte
+	// dialDone should be closed by dialChannelToRemote which is reading from the dialCh.
+	// It should only be closed when it has read to the end of the channel and sent the packets.
+	dialDone  chan struct{}
+
+	// sendCh is a queue to decouple reads from the data plane
+	// to the corresponding writes to the ANP Server.
+	// This is for traffic going toward the KAS
 	sendCh    chan []byte
+	// sendDone should be closed by sendChannelToProxy which is reading from sendCh.
+	// It should only be closed when it has read to the end of the channel and sent the packets.
+	sendDone  chan struct{}
+
 	cleanOnce sync.Once
 	warnChLim bool
-	dialDone  chan struct{}
-	sendDone  chan struct{}
 }
 
 func (e *endpointConn) cleanup() {
@@ -384,14 +397,14 @@ func (a *Client) Serve() {
 
 			connID := atomic.AddInt64(&a.nextConnID, 1)
 			dataCh := make(chan []byte, a.cs.xfrChannelSize)
-			sendCh := make(chan []byte, a.cs.xfrChannelSize)
 			dialDone := make(chan struct{})
+			sendCh := make(chan []byte, a.cs.xfrChannelSize)
 			sendDone := make(chan struct{})
 			eConn := &endpointConn{
 				connID:    connID,
 				dataCh:    dataCh,
-				sendCh:    sendCh,
 				dialDone:  dialDone,
+				sendCh:    sendCh,
 				sendDone:  sendDone,
 				warnChLim: a.warnOnChannelLimit,
 			}
@@ -460,6 +473,24 @@ func (a *Client) Serve() {
 						klog.ErrorS(err, "could not send DIAL_RSP with error", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
 					}
 					close(eConn.sendDone)
+					// Consume the channel until it is closed.
+					discardedPktCount := 0
+					reading := true
+					for reading {
+						// Ignore values as this indicates there was a problem
+						// with the remote connection. Pulling non blocking from
+						// the channel as it may not have been closed yet and we
+						// don't want to leave a goroutine hanging.
+						select {
+    						case <- eConn.sendCh:
+							discardedPktCount++
+    						default:
+							reading = false
+    						}
+					}
+					if discardedPktCount > 0 {
+						klog.V(1).InfoS("Discard packets from failed Dial", "pktCount", discardedPktCount, "dialID", dialReq.Random, "connectionID", connID)
+					}
 					// Cannot invoke clean up as we have no conn yet.
 					return
 				}
@@ -479,7 +510,7 @@ func (a *Client) Serve() {
 				if err := a.Send(dialResp); err != nil {
 					klog.ErrorS(err, "could not send DIAL_RSP", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
 					close(eConn.sendDone)
-					// clean-up is normally called from remoteToProxy which we will never invoke.
+					// clean-up is normally called from sendChannelToProxy which we will never invoke.
 					// So we are invoking it here to force the clean-up to occur.
 					// However, cleanup will block until dialDone is closed.
 					// So placing cleanup on its own goroutine to wait for the deferred close(dialDone) to kick in.
@@ -562,6 +593,7 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 		klog.V(5).InfoS("received data from remote", "bytes", n, "connectionID", connID)
 
 		if err == io.EOF {
+			klog.V(2).InfoS("remote connection EOF", "connectionID", connID)
 			return
 		} else if err != nil {
 			// "use of closed network connection" errors are expected upon receiving CLOSE_REQ
@@ -591,9 +623,9 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 	defer close(eConn.sendDone)
 	defer func() {
 		if panicInfo := recover(); panicInfo != nil {
-			klog.V(2).InfoS("Exiting sendChannelToProxy with recovery", "panicInfo", panicInfo, "connectionID", connID)
+			klog.V(0).InfoS("Exiting sendChannelToProxy with recovery", "panicInfo", panicInfo, "connectionID", connID)
 		} else {
-			klog.V(4).InfoS("Exiting sendChannelToProxy", "connectionID", connID)
+			klog.V(2).InfoS("Exiting sendChannelToProxy", "connectionID", connID)
 		}
 	}()
 	// Not safe to call cleanup here, as cleanup() closes the sendCh
@@ -627,6 +659,11 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 
 		if err := a.Send(resp); err != nil {
 			klog.ErrorS(err, "could not send DATA", "connectionID", connID)
+			// We failed to write to the muxed tunnel back to the ANP Server.
+			// Chances are something is fairly wrong. Going to close out what
+			// we are doing so we don't leave hanging goroutines.
+			// Not worried about queued packets as the clean up should handle it.
+			return
 		}
 	}
 }
@@ -676,7 +713,6 @@ func (a *Client) dataChannelToRemote(connID int64, eConn *endpointConn) {
 				} else {
 					klog.ErrorS(err, "conn write failure", "connectionID", connID)
 				}
-
 				return
 			}
 		}

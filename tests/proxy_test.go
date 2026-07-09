@@ -570,7 +570,7 @@ func TestProxy_LargeResponse(t *testing.T) {
 	expectCleanShutdown(t)
 
 	ctx := context.Background()
-	length := 1 << 21 // 1M
+	length := 1 << 21 // 2M
 	chunks := 10
 	server := httptest.NewServer(newSizedServer(length, chunks))
 	defer server.Close()
