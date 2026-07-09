@@ -61,7 +61,7 @@ KIND_IMAGE ?= kindest/node:v1.30.2
 CONNECTION_MODE ?= grpc
 
 MOCKGEN_VERSION := $(shell mockgen -version)
-DESIRED_MOCKGEN := "v0.5.2"
+DESIRED_MOCKGEN := "v0.6.0"
 
 ## --------------------------------------
 ## Testing
